@@ -1,0 +1,580 @@
+---
+title: Fitting SIR Model to Influenza in a Boarding School data set using Generalised
+  Least Squares
+author: "Nik Cunniffe"
+date: "9 December 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+###
+# Load libraries
+##
+library(gdata)
+library(deSolve)
+library(mvtnorm)
+
+###
+# Seed rng for reproducibility
+###
+set.seed(01122021)
+```
+
+## Introduction
+
+This is a markdown showing how the SIR model can be fitted using generalised least squares in a case where it is identifiable.
+
+```{r functionCode, echo=F}
+###
+# Right hand side of the ODE for the model
+###
+sirModel <- function(t, y, p) 
+{
+  S <- y[1]
+  I <- y[2]
+
+  dS <- -p$beta*S*I/p$N
+  dI <- p$beta*S*I/p$N - p$gamma*I
+
+  return(list(c(dS,dI)))  
+}
+
+###
+# Function which calculates the squared error for generalised least squares
+#
+# Note that we estimate transformed parameters
+#     par[1] = log(R_0-1)
+#     par[2] = log(gamma)
+# to avoid having to constrain the optimiser 
+#
+# Since R_0 = beta/gamma the parameters of interest follow by back-transforming
+#   gamma = exp(par[2])
+#   beta  = gamma * (1 + exp(par[1]))
+###
+
+glsBoarding <- function(par,dataT,dataObs,dataW,trueSZero,trueIZero,trueN)
+{
+  thisR0MinusOne <- exp(par[1])   # estimate log(R_0 - 1) 
+  thisGamma <- exp(par[2])        # estimate log(gamma)
+
+  thisBeta <- thisGamma * (1 + thisR0MinusOne)
+  
+  myParms <- list(
+    beta = thisBeta,
+    gamma = thisGamma,
+    N = trueN
+  )
+  
+  myInit <- c(S=trueSZero, I=trueIZero)
+  
+  myOutput <- ode(y = myInit, 
+                  times = dataT, 
+                  func = sirModel, 
+                  parms = myParms)
+  
+  fitI <- myOutput[,3]
+
+  sqErr <- 0
+  for(i in 1:length(dataT))
+  {
+    sqErr <- sqErr + dataW[i] * (fitI[i] - dataObs[i])^2  
+  }
+  errFunc <- sqErr
+  
+  return(errFunc)
+}
+
+###
+# Perform a single step of the GLS optimisation
+###
+singleStep <- function(startBeta,
+                       startGamma,
+                       startWeights,
+                       initStep,
+                       nFits,
+                       dataT,
+                       dataObs,
+                       trueSZero,
+                       trueIZero,
+                       trueN,
+                       rho)
+{
+
+  allBeta <- numeric(nFits)
+  allGamma <- numeric(nFits)
+  allLS <- numeric(nFits)
+  
+  #
+  # Do nFit separate fits
+  #
+  for(i in 1:nFits)
+  {
+    if(initStep)
+    {
+      # if doing the initial step, randomly choose baseline start value and set weights to 1
+      thisStartGamma <- runif(1,min=0.1,max=1)
+      thisStartR0MinusOne <- runif(1,min=0.1,max=1) 
+      startWeights <- rep(1,length(dataT))
+    }else{
+      # otherwise start from "quite near" to the estimate from the previous step
+      thisStartGamma <- startGamma * runif(1,min=0.9,max=1.1)
+      thisStartR0MinusOne <- (startBeta/startGamma - 1) * runif(1,min=0.9,max=1.1)
+    }
+    
+    glsParams <- optim(par = c(log(thisStartR0MinusOne), 
+                               log(thisStartGamma)), 
+                               fn = glsBoarding, 
+                               dataT = dataT,
+                               dataObs = dataObs,
+                               dataW = startWeights,
+                               trueSZero = trueSZero,
+                               trueIZero = trueIZero,
+                               trueN = trueN,
+                               control=list(maxit=10000))
+    if(glsParams$convergence == 0)
+    {
+      allGamma[i] <- exp(glsParams$par[2])
+      allBeta[i] <- allGamma[i] * ( 1 + exp(glsParams$par[1]))
+      allLS[i] <- glsParams$value
+    }else{
+      allBeta[i] <- NA
+      allGamma[i] <- NA
+      allLS[i] <- NA
+    }
+  }
+
+  #
+  # Select the best fitting of all nFits attempts
+  # and re-run the ODE to calculate the weights for the 
+  # next step of the optimisation
+  #
+  minIDX <- which(allLS==min(allLS,na.rm=T))[1]
+  
+  bestBeta <- allBeta[minIDX]
+  bestGamma <- allGamma[minIDX]
+  bestLS <- allLS[minIDX]
+
+  myParms <- list(
+    beta = bestBeta,
+    gamma = bestGamma,
+    N = trueN
+  )
+  
+  myInit <- c(S=trueSZero, I=trueIZero)
+  
+  myOutput <- ode(y = myInit, 
+                  times = dataT, 
+                  func = sirModel, 
+                  parms = myParms)
+  
+  fitI <- myOutput[,3]
+    
+  bestWeights <- 1.0/fitI^(2*rho)
+  retVal <- list(beta = bestBeta, 
+                 gamma = bestGamma, 
+                 weights = bestWeights, 
+                 lSq = bestLS)
+}
+
+###
+# Right hand side of the ODE for the Fisher Information Matrix
+###
+fimRHS <- function(t, y, p) 
+{
+  S <- y[1]
+  I <- y[2]
+  
+  z <- matrix(c(y[3],
+                y[4],
+                y[5],
+                y[6]),
+              nrow=2,
+              ncol=2,
+              byrow=F) # byrow = F -> fills in order top-left, bottom-left, top-right, bottom-right
+  
+  A <- matrix(c(-p$beta * I / N,          # top-left
+                p$beta * I / N,          # bottom-left
+                -p$beta * S / N,          # top-right
+                p$beta * S / N - p$gamma), # bottom-right
+              nrow=2,
+              ncol=2,
+              byrow=F)
+  
+  B <- matrix(c(-S * I / p$N,         
+                S * I / p$N,          
+                0,         
+                -I), 
+              nrow=2,
+              ncol=2,
+              byrow=F)
+  
+  xDot <- sirModel(t, c(S=S,I=I), p)
+  
+  zDot <- A %*% z + B  
+  
+  return(list(c(xDot[[1]][1],xDot[[1]][2],zDot[1,1],zDot[2,1],zDot[1,2],zDot[2,2])))
+}
+
+###
+# Use the Fisher Information Matrix to extract confidence intervals
+###
+calcCI <- function(estBeta,
+                    estGamma,
+                    dataT,
+                    dataObs,
+                    trueSZero,
+                    trueIZero,
+                    trueN,
+                    rho)
+{
+  #
+  # calculate sigmaHatSqGLS by first solving the system
+  # with the estimated parameters, to find the weights
+  #
+  myParms <- list(beta = estBeta,
+                  gamma = estGamma,
+                  N = trueN)
+  
+  myInit <- c(S=trueSZero, 
+              I=trueIZero)
+  
+  myOutput <- ode(y = myInit, 
+                  times = dataT, 
+                  func = sirModel, 
+                  parms = myParms)
+  
+  fitI <- myOutput[,3]
+  
+  sqErr <- 0
+  numPts <- length(dataT)
+  w <- length(dataT)
+  for(i in 1:numPts)
+  {
+    sqErr <- sqErr + (fitI[i] - dataObs[i])^2 / fitI[i]^(2*rho)
+    w[i] <- 1.0 / fitI[i]^(2*rho)
+  }
+  sigmaHatSqGLS <- sqErr/(numPts - 2)
+
+  #
+  # Calculate confidence intervals using FIM
+  #
+  myInitLong <- c(S=S0, 
+                  I=I0, 
+                  z_11=0, 
+                  z_21=0, 
+                  z_12=0, 
+                  z_22=0)
+  
+  myOutputLong <- ode(y = myInitLong, 
+                  times = dataT, 
+                  func = fimRHS,
+                  parms = myParms)
+  
+  m<-rbind(myOutputLong[,"z_21"],
+           myOutputLong[,"z_22"]) 
+  
+  fim_11 <- 0
+  fim_21 <- 0
+  fim_12 <- 0
+  fim_22 <- 0
+  
+  for(i in 1:numPts)
+  {
+    thisM <- m[,i]
+    fim_11 <- fim_11 + w[i] * thisM[1] * thisM[1]
+    fim_21 <- fim_21 + w[i] * thisM[2] * thisM[1]
+    fim_12 <- fim_12 + w[i] * thisM[1] * thisM[2]
+    fim_22 <- fim_22 + w[i] * thisM[2] * thisM[2]
+  }
+  
+  fimMat <- matrix(c(fim_11,
+                     fim_21,
+                     fim_12,
+                     fim_22), 
+                   nrow=2,
+                   ncol=2,
+                   byrow=F)
+  
+  fimMat <- fimMat / sigmaHatSqGLS
+  
+  covMat <- solve(fimMat)
+  
+  tCrit <- qt(0.975, df = (numPts - 2))
+  betaCI <- tCrit * sqrt(covMat[1,1])
+  gammaCI <- tCrit * sqrt(covMat[2,2])
+  
+  condNumFIM <- kappa(fimMat,exact=T)
+
+  return(list(sigmaHatSqGLS=sigmaHatSqGLS,
+              betaCI=betaCI,
+              gammaCI=gammaCI,
+              covMat=covMat,
+              condNumFIM=condNumFIM))  
+}
+
+#
+# Plot the data, the best fit and a sample of numPlots runs using estimated parameters
+# Note here we sample from the 2 dimension distribution (i.e. including covariance)
+#
+# If outFile is NA, then plot to the screen (or insert into results of Markdown)
+#
+plotFit <- function(allData,
+                    numPlots,
+                    thisRes,
+                    confInt,
+                    rho,
+                    outFile)
+{
+  #
+  # Plot out the data
+  #
+  if(!is.na(outFile))
+  {
+    outFile <- sprintf("%s.png",outFile)
+    png(outFile,width=560,height=560)
+    par(cex.lab=2)
+    par(cex.axis=2)
+    par(cex.main=2)
+    par(mgp=c(5, 2, 0))
+    par(mar=c(7, 7, 2, 2))
+  }
+  par(las=1)
+  plot(allData$x,
+       allData$y,
+       pch=19,
+       col="blue",
+       xlab = "time t (in day)",
+       ylab = "number of infectious at time t",
+       xlim=c(0,13),
+       ylim=c(0,350))
+  
+  #
+  # take samples from the distribution of parameters
+  # and plot in grey
+  #
+  
+  thisDF <- length(allData$x)-2 
+  sampledParams <- rmvt(numPlots,
+                        delta=c(thisRes$beta,thisRes$gamma),
+                        sigma=confInt$covMat,
+                        type="shifted",
+                        df=thisDF)
+  
+  myInit <- c(S=S0, 
+              I=I0)
+  myTimes <- seq(0,13,length.out=100)
+  for(z in 1:numPlots)
+  {
+    myParms <- list(
+      beta = sampledParams[z,1],
+      gamma = sampledParams[z,2],
+      N = N
+    )
+    
+    myOutput <- ode(y = myInit, 
+                    times = myTimes, 
+                    func = sirModel, 
+                    parms = myParms)
+    
+    lines(myOutput[,"time"],myOutput[,"I"],col="gray") 
+  }
+  
+  #
+  # plot for best fit
+  #
+  myParms <- list(
+    beta = thisRes$beta,
+    gamma = thisRes$gamma,
+    N = N
+  )
+  
+  myOutput <- ode(y = myInit, 
+                  times = myTimes, 
+                  func = sirModel, 
+                  parms = myParms)
+  
+  lines(myOutput[,"time"],myOutput[,"I"],col="red",lwd=2) 
+  
+  
+  #
+  # replot data itself to ensure emphasised
+  #
+  points(allData$x,
+         allData$y,
+         pch=19,
+         col="blue")
+  
+  legend("topright",c("Data","Best fit","Samples"),col=c("blue","red","grey"),lwd=c(NA,2,1),pch=c(19,NA,NA),cex=1)
+  
+  s <- sprintf("r=%.2f b=%.4f+-%.4f g=%.4f+-%.4f", 
+               rho, 
+               thisRes$beta, 
+               confInt$betaCI,
+               thisRes$gamma,
+               confInt$gammaCI)
+  
+  title(s)
+  
+  plot(sampledParams[,1],
+       sampledParams[,2],
+       xlab=expression("Infection rate "~beta),
+       ylab=expression("Removal rate "~gamma),
+       main=paste(numPlots,"samples of pairs of parameters"),
+       pch = 19,
+       col="grey")
+  
+  lines(c(thisRes$beta-confInt$betaCI,thisRes$beta-confInt$betaCI),
+        c(par("usr")[3],par("usr")[4]),
+        col="purple",
+        lty=2)
+
+  lines(c(thisRes$beta+confInt$betaCI,thisRes$beta+confInt$betaCI),
+        c(par("usr")[3],par("usr")[4]),
+        col="purple",
+        lty=2)
+
+  lines(c(par("usr")[1],par("usr")[2]),
+        c(thisRes$gamma-confInt$gammaCI,thisRes$gamma-confInt$gammaCI),
+        col="purple",
+        lty=2)
+  
+  lines(c(par("usr")[1],par("usr")[2]),
+        c(thisRes$gamma+confInt$gammaCI,thisRes$gamma+confInt$gammaCI),
+        col="purple",
+        lty=2)
+  
+  points(thisRes$beta,thisRes$gamma,pch=19,cex=3,col="red")
+
+  legend("bottomleft",
+         c("Samples","Best fit","CI"),
+         col=c("grey","red","purple"),
+         lwd=c(NA,NA,1),
+         lty=c(NA,NA,2), 
+         pch=c(19,19,NA),
+         pt.cex=c(1,3,1))
+  
+  
+  if(!is.na(outFile))
+  {
+    dev.off() 
+  }
+}
+```
+
+## Reading in data
+
+Read in the data (either the path `baseDir` will need to be changed to run on a different computer, or you will have to knit the file from within the same directory as the `Boarding.xlsx` file)
+```{r localSetup}
+###
+# Set working directory
+###
+# baseDir <- "your working directory"
+# setwd(baseDir)
+
+allData <- read.xls("Boarding.xlsx")
+head(allData)
+```
+
+## Setting up known parameters
+
+We are only fitting $\beta$ and $\gamma$, with the remaining parameters and initial conditions being known. Note that throughout the code it is assumed that there are no recovered individuals initially, i.e. $R(0) = 0$, and that all infecteds are observed, i.e. $k = 1$.
+```{r setupParameters}
+S0 <- 762
+I0 <- 1
+N <- 763
+```
+
+## Running the generalised least squares algorithm
+
+Before running the loop, we need to set parameters controlling how the generalised least squares iteration will work.
+```{r setupGLSParameters}
+rho <- 1           # form of the weighting
+nFits <- 25          # how many distinct fits to attempt on each step of the GLS algorithm
+maxIts <- 20         # alternative stopping condition; if not converged within maxIts iteration, then stop 
+sqParamDiffThresh <- 1e-8  # criterion that successive estimates of $\Theta_k$ are "sufficiently close"
+``` 
+
+Do the iteration (note that if `rho = 0` -- i.e. ordinary least squares -- the loop only ever takes a single step, since the fit does not change)
+```{r doGLS}
+thisRes <- list(beta = 0, gamma = 0, weights = NA)
+thisStep <- 0
+sqParamDiff <- 1
+while(thisStep <= maxIts & sqParamDiff > sqParamDiffThresh)
+{
+  nextRes <- singleStep(thisRes$beta,
+                        thisRes$gamma,
+                        thisRes$weights,
+                        (thisStep==0),
+                        nFits = nFits,
+                        dataT = allData$x,
+                        dataObs = allData$y,
+                        trueSZero = S0,
+                        trueIZero = I0,
+                        trueN = N,
+                        rho = rho)
+  
+  sqParamDiff <- (thisRes$beta-nextRes$beta)^2 + 
+                  (thisRes$gamma-nextRes$gamma)^2 
+  
+  thisRes <- nextRes
+  
+  print("***")
+  print(paste("After step",thisStep))
+  print(paste("beta =",thisRes$beta))
+  print(paste("gamma =",thisRes$gamma))
+  print(paste("lSq =",thisRes$lSq))
+  print(paste("sqParamDiff =",sqParamDiff))
+  print("***")
+  if(sqParamDiff > sqParamDiffThresh)
+  {
+    thisStep <- thisStep + 1  
+  }
+  if(rho == 0)
+  {
+    sqParamDiff <- 0
+    print("Short circuit iteration since rho = 0")
+  }
+}
+```
+
+## Calculate and report the confidence intervals
+
+```{r findCI}
+confInt <- calcCI(estBeta = thisRes$beta,
+                        estGamma = thisRes$gamma,
+                        dataT=allData$x,
+                        dataObs = allData$y,
+                        trueSZero = S0,
+                        trueIZero = I0, 
+                        trueN = N, 
+                        rho = rho)
+
+s <- sprintf("rho=%.2f beta=%.4f+-%.4f gamma=%.4f+-%.4f (converged after %d iterations)", 
+             rho, 
+             thisRes$beta, 
+             confInt$betaCI,
+             thisRes$gamma,
+             confInt$gammaCI,
+             thisStep)
+
+print(s)
+
+s <- sprintf("Condition number=%.4f",confInt$condNumFIM)
+print(s)
+
+print("The covariance matrix is")
+print(confInt$covMat)
+```
+
+## Plot best fitting model
+
+```{r plotFit}
+plotFit(allData,100,thisRes,confInt,rho,NA)
+```
+
+## Utility functions
+
+The code as shown above uses the following utility functions to actually do the calculations
+```{r functionCode, eval=F}
+```
